@@ -1,0 +1,308 @@
+const express = require('express');
+const admin = require('firebase-admin');
+const cors = require('cors');
+
+const app = express();
+app.use(express.json());
+app.use(cors());
+
+admin.initializeApp({
+  credential: admin.credential.cert({
+    projectId: process.env.FIREBASE_PROJECT_ID,
+    privateKey: process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, '\n'),
+    clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
+  })
+});
+
+const db = admin.firestore();
+
+async function verifyToken(req, res, next) {
+  const authHeader = req.headers.authorization;
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return res.status(401).json({ error: 'غير مصرح' });
+  }
+  const idToken = authHeader.split('Bearer ')[1];
+  try {
+    const decodedToken = await admin.auth().verifyIdToken(idToken);
+    req.uid = decodedToken.uid;
+    next();
+  } catch (err) {
+    return res.status(401).json({ error: 'توكن غير صالح' });
+  }
+}
+
+// 1. الدفع في متجر
+app.post('/payStore', verifyToken, async (req, res) => {
+  try {
+    const { sessionId } = req.body;
+    const uid = req.uid;
+    if (!sessionId) return res.status(400).json({ error: 'كود الجلسة مطلوب' });
+
+    const sessionRef = db.collection('paymentSessions').doc(sessionId);
+    const walletRef = db.collection('wallets').doc(uid);
+
+    const result = await db.runTransaction(async (t) => {
+      const sDoc = await t.get(sessionRef);
+      const wDoc = await t.get(walletRef);
+      if (!sDoc.exists) throw new Error('الجلسة غير موجودة');
+      if (!wDoc.exists) throw new Error('المحفظة غير موجودة');
+
+      const session = sDoc.data();
+      const wallet = wDoc.data();
+
+      if (session.status !== 'pending') throw new Error('الجلسة غير صالحة');
+      if (session.expiresAt && session.expiresAt.toDate() < new Date()) {
+        throw new Error('انتهت صلاحية الجلسة');
+      }
+
+      const amount = session.amount;
+      const balance = wallet.balance || 0;
+      if (balance < amount) throw new Error('الرصيد غير كافٍ');
+
+      const newBalance = balance - amount;
+      t.update(walletRef, { balance: newBalance, lastUpdated: admin.firestore.FieldValue.serverTimestamp() });
+      t.update(sessionRef, {
+        status: 'paid', userId: uid, userName: wallet.userName || 'عميل',
+        userSahriaId: wallet.sahriaId || '',
+        paidAt: admin.firestore.FieldValue.serverTimestamp(),
+        paymentMethod: 'customer_app_qr'
+      });
+
+      return { newBalance, amount, receiptNumber: session.receiptNumber || 'SRH' + Date.now().toString().slice(-6) };
+    });
+
+    res.json({ success: true, ...result });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+// 2. تحويل الرصيد
+app.post('/transferBalance', verifyToken, async (req, res) => {
+  try {
+    const { toSahriaId, amount } = req.body;
+    const fromUid = req.uid;
+    if (!toSahriaId || !amount || amount <= 0) return res.status(400).json({ error: 'بيانات غير صالحة' });
+
+    const receiverSnap = await db.collection('wallets')
+      .where('sahriaId', '==', toSahriaId.trim().toUpperCase()).limit(1).get();
+    if (receiverSnap.empty) return res.status(404).json({ error: 'المستلم غير موجود' });
+
+    const receiverDoc = receiverSnap.docs[0];
+    const toUid = receiverDoc.id;
+    if (fromUid === toUid) return res.status(400).json({ error: 'لا يمكن التحويل لنفسك' });
+
+    const fromWalletRef = db.collection('wallets').doc(fromUid);
+    const toWalletRef = db.collection('wallets').doc(toUid);
+
+    const result = await db.runTransaction(async (t) => {
+      const fromDoc = await t.get(fromWalletRef);
+      const toDoc = await t.get(toWalletRef);
+      if (!fromDoc.exists) throw new Error('محفظتك غير موجودة');
+      if (!toDoc.exists) throw new Error('محفظة المستلم غير موجودة');
+
+      const fromBal = fromDoc.data().balance || 0;
+      const toBal = toDoc.data().balance || 0;
+      if (fromBal < amount) throw new Error('الرصيد غير كافٍ');
+
+      t.update(fromWalletRef, { balance: fromBal - amount, lastUpdated: admin.firestore.FieldValue.serverTimestamp() });
+      t.update(toWalletRef, { balance: toBal + amount, lastUpdated: admin.firestore.FieldValue.serverTimestamp() });
+
+      return {
+        newBalance: fromBal - amount,
+        receiverName: toDoc.data().userName || 'مستخدم',
+        fromName: fromDoc.data().userName || 'مستخدم'
+      };
+    });
+
+    await db.collection('transfers').add({
+      fromUserId: fromUid, toUserId: toUid,
+      fromUserName: result.fromName, toUserName: result.receiverName,
+      amount, timestamp: admin.firestore.FieldValue.serverTimestamp()
+    });
+
+    res.json({ success: true, ...result });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+// 3. استرداد كود شحن
+app.post('/redeemVoucher', verifyToken, async (req, res) => {
+  try {
+    const { code } = req.body;
+    const uid = req.uid;
+    if (!code) return res.status(400).json({ error: 'الكود مطلوب' });
+
+    const cleanCode = code.trim().toUpperCase();
+    const voucherSnap = await db.collection('vouchers').where('code', '==', cleanCode).limit(1).get();
+    if (voucherSnap.empty) return res.status(404).json({ error: 'كود غير صالح' });
+
+    const voucherDoc = voucherSnap.docs[0];
+    const walletRef = db.collection('wallets').doc(uid);
+
+    const result = await db.runTransaction(async (t) => {
+      const vDoc = await t.get(voucherDoc.ref);
+      const wDoc = await t.get(walletRef);
+      if (!vDoc.exists) throw new Error('الكود غير موجود');
+      if (!wDoc.exists) throw new Error('المحفظة غير موجودة');
+
+      const voucher = vDoc.data();
+      const wallet = wDoc.data();
+      if (voucher.used) throw new Error('الكود مستخدم');
+      if (voucher.expiry && new Date(voucher.expiry) < new Date()) throw new Error('انتهت صلاحية الكود');
+
+      const amount = voucher.amount;
+      const newBalance = (wallet.balance || 0) + amount;
+
+      t.update(walletRef, { balance: newBalance, lastUpdated: admin.firestore.FieldValue.serverTimestamp() });
+      t.update(voucherDoc.ref, {
+        used: true, usedBy: uid,
+        usedByName: wallet.userName || 'مستخدم',
+        usedAt: admin.firestore.FieldValue.serverTimestamp()
+      });
+
+      return { newBalance, amount };
+    });
+
+    res.json({ success: true, ...result });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+// 4. شحن الموبايل
+app.post('/topupMobile', verifyToken, async (req, res) => {
+  try {
+    const { phone, amount, operator } = req.body;
+    const uid = req.uid;
+    if (!phone || !amount || !operator) return res.status(400).json({ error: 'بيانات ناقصة' });
+
+    const walletRef = db.collection('wallets').doc(uid);
+    const result = await db.runTransaction(async (t) => {
+      const wDoc = await t.get(walletRef);
+      if (!wDoc.exists) throw new Error('المحفظة غير موجودة');
+      const wallet = wDoc.data();
+      const balance = wallet.balance || 0;
+      if (balance < amount) throw new Error('الرصيد غير كافٍ');
+
+      t.update(walletRef, { balance: balance - amount, lastUpdated: admin.firestore.FieldValue.serverTimestamp() });
+      return { newBalance: balance - amount };
+    });
+
+    await db.collection('mobileCredits').add({
+      userId: uid, phone, amount, operator, status: 'جديد',
+      createdAt: admin.firestore.FieldValue.serverTimestamp()
+    });
+
+    res.json({ success: true, ...result });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+// 5. شراء تذكرة سفر
+app.post('/bookTravel', verifyToken, async (req, res) => {
+  try {
+    const { name, phone, passengers, driverId, travelDay } = req.body;
+    const uid = req.uid;
+    if (!name || !phone || !driverId || !travelDay) return res.status(400).json({ error: 'بيانات ناقصة' });
+
+    const driverDoc = await db.collection('drivers').doc(driverId).get();
+    if (!driverDoc.exists) return res.status(404).json({ error: 'السائق غير موجود' });
+
+    const driver = driverDoc.data();
+    const totalPrice = (driver.price || 0) * passengers;
+    const walletRef = db.collection('wallets').doc(uid);
+
+    const result = await db.runTransaction(async (t) => {
+      const wDoc = await t.get(walletRef);
+      if (!wDoc.exists) throw new Error('المحفظة غير موجودة');
+      const wallet = wDoc.data();
+      const balance = wallet.balance || 0;
+      if (balance < totalPrice) throw new Error('الرصيد غير كافٍ');
+
+      t.update(walletRef, { balance: balance - totalPrice, lastUpdated: admin.firestore.FieldValue.serverTimestamp() });
+      return { newBalance: balance - totalPrice };
+    });
+
+    const ticketId = 'SRH-' + Math.floor(Math.random() * 10000000);
+
+    await db.collection('travelBookings').add({
+      ticketId, userId: uid, customerName: name, phone, passengers, totalPrice,
+      driverId, driverName: driver.name, driverPhone: driver.phone || '',
+      travelDay, status: 'جديد', paidFromWallet: true,
+      createdAt: admin.firestore.FieldValue.serverTimestamp()
+    });
+
+    res.json({ success: true, ticketId, totalPrice, driverName: driver.name, newBalance: result.newBalance });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+// 6. الدفع NFC (من الكاشير)
+app.post('/payNfc', async (req, res) => {
+  try {
+    const { nfcCardId, amount, cartItems, receiptNumber } = req.body;
+    if (!nfcCardId || !amount || amount <= 0) return res.status(400).json({ error: 'بيانات غير صالحة' });
+
+    const walletSnap = await db.collection('wallets').where('nfcCardId', '==', nfcCardId).limit(1).get();
+    if (walletSnap.empty) return res.status(404).json({ error: 'البطاقة غير مسجلة' });
+
+    const walletDoc = walletSnap.docs[0];
+    const walletRef = walletDoc.ref;
+
+    const result = await db.runTransaction(async (t) => {
+      const wDoc = await t.get(walletRef);
+      if (!wDoc.exists) throw new Error('المحفظة غير موجودة');
+      const wallet = wDoc.data();
+      if (wallet.disabled) throw new Error('حساب العميل معطل');
+
+      const balance = wallet.balance || 0;
+      if (balance < amount) throw new Error('الرصيد غير كافٍ');
+
+      t.update(walletRef, { balance: balance - amount, lastUpdated: admin.firestore.FieldValue.serverTimestamp() });
+      return { newBalance: balance - amount, userName: wallet.userName || 'عميل' };
+    });
+
+    await db.collection('partnerTransactions').add({
+      partnerName: 'الكاشير الذاتي', userId: walletDoc.id, userName: result.userName,
+      amount, type: 'payment', paymentMethod: 'card_nfc',
+      receiptNumber: receiptNumber || 'NFC' + Date.now(),
+      items: cartItems || [], timestamp: admin.firestore.FieldValue.serverTimestamp()
+    });
+
+    res.json({ success: true, ...result });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+// 7. الدفع كاش
+app.post('/payCash', async (req, res) => {
+  try {
+    const { amount, cartItems, receiptNumber } = req.body;
+    if (!amount || amount <= 0) return res.status(400).json({ error: 'مبلغ غير صالح' });
+
+    await db.collection('partnerTransactions').add({
+      partnerName: 'الكاشير الذاتي', userId: null, userName: 'نقدي',
+      amount, type: 'cash_payment', paymentMethod: 'cash',
+      receiptNumber: receiptNumber || 'CASH' + Date.now(),
+      items: cartItems || [], timestamp: admin.firestore.FieldValue.serverTimestamp()
+    });
+
+    res.json({ success: true });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+app.get('/', (req, res) => {
+  res.json({ status: 'ok', service: 'SAHRIA API' });
+});
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log('SAHRIA API running on port ' + PORT);
+});
